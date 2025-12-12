@@ -1,0 +1,229 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "BCG DevOps Agent API",
+    "version": "1.0.0",
+    "description": "API for BCG DevOps GenAI Agent actions"
+  },
+  "paths": {
+    "/analyze-repository": {
+      "post": {
+        "operationId": "analyzeRepository",
+        "summary": "Analyze a GitHub repository",
+        "description": "Analyzes a GitHub repository to detect tech stack, frameworks, and existing CI/CD configuration",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["owner", "repo"],
+                "properties": {
+                  "owner": {
+                    "type": "string",
+                    "description": "GitHub repository owner/organization"
+                  },
+                  "repo": {
+                    "type": "string",
+                    "description": "GitHub repository name"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Repository analysis results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "owner": {"type": "string"},
+                    "repo": {"type": "string"},
+                    "primary_language": {"type": "string"},
+                    "tech_stack": {
+                      "type": "array",
+                      "items": {"type": "string"}
+                    },
+                    "has_dockerfile": {"type": "boolean"},
+                    "has_kubernetes": {"type": "boolean"},
+                    "has_workflows": {"type": "boolean"},
+                    "package_manager": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/generate-workflow": {
+      "post": {
+        "operationId": "generateWorkflow",
+        "summary": "Generate a GitHub Actions workflow",
+        "description": "Generates a GitHub Actions CI/CD workflow based on repository analysis and user requirements",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["prompt"],
+                "properties": {
+                  "prompt": {
+                    "type": "string",
+                    "description": "User's description of the CI/CD requirements"
+                  },
+                  "tech_stack": {
+                    "type": "string",
+                    "description": "Detected or specified tech stack"
+                  },
+                  "include_security_scan": {
+                    "type": "boolean",
+                    "description": "Include security scanning in workflow",
+                    "default": true
+                  },
+                  "include_deploy": {
+                    "type": "boolean",
+                    "description": "Include deployment stages",
+                    "default": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Generated workflow",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "workflow": {"type": "string"},
+                    "model": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/scan-workflow": {
+      "post": {
+        "operationId": "scanWorkflow",
+        "summary": "Scan workflow for security issues",
+        "description": "Validates a GitHub Actions workflow for security vulnerabilities and best practices",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["workflow_content"],
+                "properties": {
+                  "workflow_content": {
+                    "type": "string",
+                    "description": "The YAML content of the GitHub Actions workflow"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Security scan results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "valid": {"type": "boolean"},
+                    "score": {"type": "integer"},
+                    "security_issues": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {"type": "string"},
+                          "name": {"type": "string"},
+                          "severity": {"type": "string"}
+                        }
+                      }
+                    },
+                    "summary": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/create-workflow-pr": {
+      "post": {
+        "operationId": "createWorkflowPR",
+        "summary": "Create a PR with the workflow",
+        "description": "Creates a new branch and pull request with the generated workflow file",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["owner", "repo", "workflow_content"],
+                "properties": {
+                  "owner": {
+                    "type": "string",
+                    "description": "GitHub repository owner"
+                  },
+                  "repo": {
+                    "type": "string",
+                    "description": "GitHub repository name"
+                  },
+                  "workflow_content": {
+                    "type": "string",
+                    "description": "The workflow YAML content"
+                  },
+                  "workflow_name": {
+                    "type": "string",
+                    "description": "Name for the workflow file",
+                    "default": "ci.yml"
+                  },
+                  "branch_name": {
+                    "type": "string",
+                    "description": "Name for the feature branch",
+                    "default": "feature/add-ci-workflow"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "PR creation result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {"type": "boolean"},
+                    "pr_url": {"type": "string"},
+                    "pr_number": {"type": "integer"},
+                    "branch": {"type": "string"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

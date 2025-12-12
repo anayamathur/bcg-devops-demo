@@ -1,0 +1,594 @@
+# Java / Spring Boot CI/CD Workflow Template
+# BCG DevOps Standards Compliant
+# Integrated: JFrog Artifactory, Prisma Cloud, SonarQube, Datadog, ArgoCD, Octopus, Slack
+
+name: Java CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  JAVA_VERSION: '21'
+  JAVA_DISTRIBUTION: 'temurin'
+  JFROG_REGISTRY: ${{ secrets.JFROG_ARTIFACTORY_URL }}
+  JFROG_REPO: 'docker-local'
+  MAVEN_REPO: 'maven-local'
+  IMAGE_NAME: ${{ github.repository }}
+  EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+# Cancel in-progress runs for same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================
+  # Code Quality & Testing
+  # ============================================
+  quality:
+    name: Code Quality & Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for SonarQube
+      
+      - name: Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: 'maven'
+      
+      # Configure JFrog Maven Repository
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: https://${{ secrets.JFROG_ARTIFACTORY_URL }}
+          JF_ACCESS_TOKEN: ${{ secrets.JFROG_ACCESS_TOKEN }}
+      
+      - name: Configure Maven for JFrog
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << 'EOF'
+          <settings xmlns="http://maven.apache.org/SETTINGS/1.2.0"
+                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                    xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.2.0
+                    https://maven.apache.org/xsd/settings-1.2.0.xsd">
+            <servers>
+              <server>
+                <id>jfrog-releases</id>
+                <username>${{ secrets.JFROG_USER }}</username>
+                <password>${{ secrets.JFROG_ACCESS_TOKEN }}</password>
+              </server>
+              <server>
+                <id>jfrog-snapshots</id>
+                <username>${{ secrets.JFROG_USER }}</username>
+                <password>${{ secrets.JFROG_ACCESS_TOKEN }}</password>
+              </server>
+            </servers>
+            <mirrors>
+              <mirror>
+                <id>jfrog-maven</id>
+                <mirrorOf>*</mirrorOf>
+                <url>https://${{ secrets.JFROG_ARTIFACTORY_URL }}/artifactory/maven-remote</url>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+      
+      # Compile and verify dependencies
+      - name: Validate and Compile
+        run: mvn clean compile -B
+      
+      # Run Checkstyle
+      - name: Checkstyle Analysis
+        run: mvn checkstyle:check -B
+        continue-on-error: true
+      
+      # Run SpotBugs
+      - name: SpotBugs Analysis
+        run: mvn spotbugs:check -B
+        continue-on-error: true
+      
+      # Run tests with coverage
+      - name: Run Unit Tests with JaCoCo
+        run: |
+          mvn test jacoco:report -B
+          echo "Test Results Summary:"
+          mvn surefire-report:report-only -B
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            target/surefire-reports/
+            target/site/jacoco/
+      
+      # Upload coverage to Codecov
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: target/site/jacoco/jacoco.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+      
+      # SonarQube Analysis
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@v2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }}
+            -Dsonar.sources=src/main/java
+            -Dsonar.tests=src/test/java
+            -Dsonar.java.binaries=target/classes
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+      
+      - name: SonarQube Quality Gate
+        uses: sonarsource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ============================================
+  # Security Scanning - Prisma Cloud + OWASP + SpotBugs
+  # ============================================
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: 'maven'
+      
+      # Gitleaks - Secret Detection
+      - name: Gitleaks Secret Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      # OWASP Dependency Check
+      - name: OWASP Dependency Check
+        run: |
+          mvn org.owasp:dependency-check-maven:check -B
+        continue-on-error: true
+      
+      - name: Upload OWASP Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: owasp-report
+          path: target/dependency-check-report.html
+      
+      # SpotBugs Security Analysis
+      - name: SpotBugs Security Scan
+        run: |
+          mvn compile spotbugs:spotbugs -Dspotbugs.effort=Max -Dspotbugs.threshold=Low -B
+        continue-on-error: true
+      
+      # Prisma Cloud SAST Scan
+      - name: Prisma Cloud SAST Scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: all
+          output_format: sarif
+          output_file_path: prisma-sast-results.sarif
+          soft_fail: false
+        env:
+          PRISMA_API_URL: ${{ secrets.PRISMA_API_URL }}
+          BC_API_KEY: ${{ secrets.PRISMA_ACCESS_KEY }}
+      
+      # Prisma Cloud SCA (Software Composition Analysis)
+      - name: Prisma Cloud SCA Scan
+        run: |
+          curl -L -o checkov https://github.com/bridgecrewio/checkov/releases/latest/download/checkov_linux_amd64
+          chmod +x checkov
+          ./checkov -f pom.xml --framework sca_package --bc-api-key ${{ secrets.PRISMA_ACCESS_KEY }} --repo-id ${{ github.repository }} --branch ${{ github.ref_name }}
+        continue-on-error: true
+      
+      # Trivy Vulnerability Scanner
+      - name: Trivy Vulnerability Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # ============================================
+  # Build & Push to JFrog Artifactory
+  # ============================================
+  build:
+    name: Build & Push to JFrog
+    needs: [quality, security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: github.event_name == 'push'
+    
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+      image_full: ${{ env.JFROG_REGISTRY }}/${{ env.JFROG_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+      jar_version: ${{ steps.version.outputs.version }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: 'maven'
+      
+      # Configure Maven for JFrog
+      - name: Configure Maven for JFrog
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml << 'EOF'
+          <settings>
+            <servers>
+              <server>
+                <id>jfrog-releases</id>
+                <username>${{ secrets.JFROG_USER }}</username>
+                <password>${{ secrets.JFROG_ACCESS_TOKEN }}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+      
+      # Extract version from POM
+      - name: Get Version
+        id: version
+        run: |
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Building version: ${VERSION}"
+      
+      # Build JAR
+      - name: Build with Maven
+        run: |
+          mvn package -DskipTests -B
+          ls -la target/*.jar
+      
+      # Deploy JAR to JFrog
+      - name: Deploy JAR to JFrog Artifactory
+        run: |
+          mvn deploy -DskipTests -B \
+            -DaltDeploymentRepository=jfrog-releases::default::https://${{ secrets.JFROG_ARTIFACTORY_URL }}/artifactory/${{ env.MAVEN_REPO }}
+      
+      # Setup Docker Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      # JFrog CLI Setup
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: https://${{ secrets.JFROG_ARTIFACTORY_URL }}
+          JF_ACCESS_TOKEN: ${{ secrets.JFROG_ACCESS_TOKEN }}
+      
+      # Login to JFrog Artifactory Docker Registry
+      - name: Login to JFrog Artifactory
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.JFROG_REGISTRY }}
+          username: ${{ secrets.JFROG_USER }}
+          password: ${{ secrets.JFROG_ACCESS_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.JFROG_REGISTRY }}/${{ env.JFROG_REPO }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+      
+      # Build Docker image
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            JAR_FILE=target/*.jar
+      
+      # Prisma Cloud Container Scan
+      - name: Prisma Cloud Container Scan
+        uses: PaloAltoNetworks/prisma-cloud-scan@v1
+        with:
+          pcc_console_url: ${{ secrets.PRISMA_CONSOLE_URL }}
+          pcc_user: ${{ secrets.PRISMA_ACCESS_KEY }}
+          pcc_pass: ${{ secrets.PRISMA_SECRET_KEY }}
+          image_name: ${{ env.JFROG_REGISTRY }}/${{ env.JFROG_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+      
+      # JFrog Xray Scan
+      - name: JFrog Xray Scan
+        run: |
+          jf docker scan ${{ env.JFROG_REGISTRY }}/${{ env.JFROG_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+        continue-on-error: true
+      
+      # Push to JFrog
+      - name: Push to JFrog Artifactory
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            JAR_FILE=target/*.jar
+      
+      # Publish build info to JFrog
+      - name: Publish Build Info
+        run: |
+          jf rt build-publish ${{ github.repository }} ${{ github.run_number }}
+
+  # ============================================
+  # Deploy to Development (EKS via ArgoCD)
+  # ============================================
+  deploy-dev:
+    name: Deploy to Dev (EKS)
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: development
+    timeout-minutes: 30
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }}-dev --region ${{ env.AWS_REGION }}
+      
+      # Update ArgoCD Application
+      - name: Deploy via ArgoCD
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          IMAGE_FULL: ${{ needs.build.outputs.image_full }}
+          APP_NAME: ${{ github.event.repository.name }}-dev
+          DEPLOY_ENV: development
+        run: |
+          # Install ArgoCD CLI
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x argocd
+          
+          # Login to ArgoCD
+          ./argocd login ${{ secrets.ARGOCD_SERVER }} \
+            --username ${{ secrets.ARGOCD_USERNAME }} \
+            --password ${{ secrets.ARGOCD_PASSWORD }} \
+            --insecure
+          
+          # Update application with new image
+          ./argocd app set $APP_NAME \
+            --helm-set image.repository=${{ env.JFROG_REGISTRY }}/${{ env.JFROG_REPO }}/${{ env.IMAGE_NAME }} \
+            --helm-set image.tag=$IMAGE_TAG
+          
+          # Sync application
+          ./argocd app sync $APP_NAME --prune
+          
+          # Wait for healthy status
+          ./argocd app wait $APP_NAME --timeout 300
+      
+      # Datadog Deployment Tracking
+      - name: Datadog Deployment Event
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          DEPLOY_ENV: development
+        run: |
+          curl -X POST "https://api.datadoghq.com/api/v1/events" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${{ secrets.DATADOG_API_KEY }}" \
+            -d '{
+              "title": "Deployment: ${{ github.event.repository.name }}",
+              "text": "Deployed version '"$IMAGE_TAG"' to '"$DEPLOY_ENV"' environment",
+              "priority": "normal",
+              "tags": ["environment:'"$DEPLOY_ENV"'", "service:${{ github.event.repository.name }}", "version:'"$IMAGE_TAG"'"],
+              "alert_type": "info"
+            }'
+      
+      # Slack Notification
+      - name: Slack Notification - Dev Deployment
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,workflow,job
+          text: ':rocket: Development deployment ${{ job.status }}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ============================================
+  # Deploy to Production (EKS via ArgoCD + Octopus)
+  # ============================================
+  deploy-prod:
+    name: Deploy to Production
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 45
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }}-prod --region ${{ env.AWS_REGION }}
+      
+      # Deploy via ArgoCD
+      - name: Deploy via ArgoCD
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          IMAGE_FULL: ${{ needs.build.outputs.image_full }}
+          APP_NAME: ${{ github.event.repository.name }}-prod
+          DEPLOY_ENV: production
+        run: |
+          # Install ArgoCD CLI
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x argocd
+          
+          # Login to ArgoCD
+          ./argocd login ${{ secrets.ARGOCD_SERVER }} \
+            --username ${{ secrets.ARGOCD_USERNAME }} \
+            --password ${{ secrets.ARGOCD_PASSWORD }} \
+            --insecure
+          
+          # Update application with new image
+          ./argocd app set $APP_NAME \
+            --helm-set image.repository=${{ env.JFROG_REGISTRY }}/${{ env.JFROG_REPO }}/${{ env.IMAGE_NAME }} \
+            --helm-set image.tag=$IMAGE_TAG
+          
+          # Sync application with automatic rollback on failure
+          ./argocd app sync $APP_NAME --prune --retry-limit 3
+          
+          # Wait for healthy status
+          ./argocd app wait $APP_NAME --timeout 600 --health
+      
+      # Trigger Octopus Deploy for additional orchestration
+      - name: Trigger Octopus Deploy
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          IMAGE_FULL: ${{ needs.build.outputs.image_full }}
+        run: |
+          curl -X POST "${{ secrets.OCTOPUS_SERVER_URL }}/api/deployments" \
+            -H "X-Octopus-ApiKey: ${{ secrets.OCTOPUS_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "ProjectId": "${{ secrets.OCTOPUS_PROJECT_ID }}",
+              "EnvironmentId": "${{ secrets.OCTOPUS_ENV_PROD_ID }}",
+              "FormValues": {
+                "ImageTag": "'"$IMAGE_TAG"'",
+                "ImageRepository": "'"$IMAGE_FULL"'"
+              }
+            }'
+      
+      # Datadog DORA Deployment Tracking
+      - name: Datadog DORA Deployment
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          DEPLOY_ENV: production
+        run: |
+          curl -X POST "https://api.datadoghq.com/api/v2/dora/deployment" \
+            -H "Content-Type: application/json" \
+            -H "DD-API-KEY: ${{ secrets.DATADOG_API_KEY }}" \
+            -d '{
+              "data": {
+                "attributes": {
+                  "started_at": "'$(date -u +%s)'000000000",
+                  "finished_at": "'$(date -u +%s)'000000000",
+                  "git": {
+                    "commit_sha": "${{ github.sha }}",
+                    "repository_url": "https://github.com/${{ github.repository }}"
+                  },
+                  "service": "${{ github.event.repository.name }}",
+                  "version": "'"$IMAGE_TAG"'",
+                  "env": "'"$DEPLOY_ENV"'"
+                }
+              }
+            }'
+      
+      # Slack Notification
+      - name: Slack Notification - Prod Deployment
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,workflow,job
+          text: ':rocket: Production deployment ${{ job.status }}'
+          mention: 'here'
+          if_mention: 'failure'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ============================================
+  # Rollback (Manual Trigger)
+  # ============================================
+  rollback:
+    name: Rollback Production
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    environment: production
+    timeout-minutes: 15
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Rollback via ArgoCD
+        run: |
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x argocd
+          
+          ./argocd login ${{ secrets.ARGOCD_SERVER }} \
+            --username ${{ secrets.ARGOCD_USERNAME }} \
+            --password ${{ secrets.ARGOCD_PASSWORD }} \
+            --insecure
+          
+          # Get history and rollback to previous
+          ./argocd app history ${{ github.event.repository.name }}-prod
+          ./argocd app rollback ${{ github.event.repository.name }}-prod
+          ./argocd app wait ${{ github.event.repository.name }}-prod --timeout 300
+      
+      - name: Slack Notification - Rollback
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              "text": ":warning: Production Rollback executed for ${{ github.event.repository.name }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

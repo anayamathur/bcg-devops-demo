@@ -1,0 +1,411 @@
+# Python/FastAPI CI/CD Workflow Template
+# BCG DevOps Standards Compliant
+# Integrated: JFrog Artifactory, Prisma Cloud, SonarQube, Datadog, ArgoCD, Octopus, Slack
+
+name: Python CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: '3.11'
+  JFROG_REGISTRY: ${{ secrets.JFROG_ARTIFACTORY_URL }}
+  JFROG_REPO: 'docker-local'
+  IMAGE_NAME: ${{ github.repository }}
+  EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  # ============================================
+  # Code Quality & Testing
+  # ============================================
+  quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      # Configure JFrog PyPI
+      - name: Configure JFrog PyPI Registry
+        run: |
+          pip config set global.index-url https://${{ secrets.JFROG_USER }}:${{ secrets.JFROG_ACCESS_TOKEN }}@${{ secrets.JFROG_ARTIFACTORY_URL }}/artifactory/api/pypi/pypi-remote/simple
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff black mypy pytest pytest-cov bandit safety
+          pip install -r requirements.txt
+      
+      - name: Lint with Ruff
+        run: ruff check . --output-format=github
+      
+      - name: Format check with Black
+        run: black --check .
+      
+      - name: Type check with MyPy
+        run: mypy . --ignore-missing-imports --no-error-summary
+      
+      - name: Run tests with coverage
+        run: pytest --cov=. --cov-report=xml --cov-report=html --junitxml=test-results.xml
+      
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@v2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }}
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/tests/**,**/__pycache__/**,**/venv/**
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.python.xunit.reportPath=test-results.xml
+      
+      - name: SonarQube Quality Gate
+        uses: sonarsource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ============================================
+  # Security Scanning - Prisma Cloud + Bandit
+  # ============================================
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install security tools
+        run: pip install safety bandit pip-audit
+      
+      # Prisma Cloud SAST Scan
+      - name: Prisma Cloud SAST Scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: all
+          output_format: sarif
+          output_file_path: prisma-sast-results.sarif
+          soft_fail: false
+        env:
+          PRISMA_API_URL: ${{ secrets.PRISMA_API_URL }}
+          BC_API_KEY: ${{ secrets.PRISMA_ACCESS_KEY }}
+      
+      # Bandit Security Linter
+      - name: Bandit security linter
+        run: bandit -r . -x ./tests,./venv -f json -o bandit-results.json
+      
+      - name: Upload Bandit results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-results
+          path: bandit-results.json
+      
+      # Safety - Check dependencies for vulnerabilities
+      - name: Check dependencies with Safety
+        run: safety check -r requirements.txt --full-report
+      
+      # pip-audit for additional vulnerability scanning
+      - name: pip-audit scan
+        run: pip-audit -r requirements.txt --format json --output pip-audit-results.json
+        continue-on-error: true
+      
+      # Trivy filesystem scan
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # ============================================
+  # Build & Push to JFrog Artifactory
+  # ============================================
+  build:
+    name: Build & Push to JFrog
+    needs: [quality, security]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'push'
+    
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+      image_full: ${{ env.JFROG_REGISTRY }}/${{ env.JFROG_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      # JFrog CLI Setup
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: https://${{ secrets.JFROG_ARTIFACTORY_URL }}
+          JF_ACCESS_TOKEN: ${{ secrets.JFROG_ACCESS_TOKEN }}
+      
+      # Login to JFrog Artifactory Docker Registry
+      - name: Login to JFrog Artifactory
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.JFROG_REGISTRY }}
+          username: ${{ secrets.JFROG_USER }}
+          password: ${{ secrets.JFROG_ACCESS_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.JFROG_REGISTRY }}/${{ env.JFROG_REPO }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+      
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      # Prisma Cloud Container Scan
+      - name: Prisma Cloud Container Scan
+        uses: PaloAltoNetworks/prisma-cloud-scan@v1
+        with:
+          pcc_console_url: ${{ secrets.PRISMA_CONSOLE_URL }}
+          pcc_user: ${{ secrets.PRISMA_ACCESS_KEY }}
+          pcc_pass: ${{ secrets.PRISMA_SECRET_KEY }}
+          image_name: ${{ env.JFROG_REGISTRY }}/${{ env.JFROG_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+      
+      # JFrog Xray Scan
+      - name: JFrog Xray Scan
+        run: |
+          jf docker scan ${{ env.JFROG_REGISTRY }}/${{ env.JFROG_REPO }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+        continue-on-error: true
+      
+      - name: Push to JFrog Artifactory
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      # Publish build info to JFrog
+      - name: Publish Build Info
+        run: |
+          jf rt build-publish ${{ github.repository }} ${{ github.run_number }}
+
+  # ============================================
+  # Deploy to Development (EKS via ArgoCD)
+  # ============================================
+  deploy-dev:
+    name: Deploy to Dev
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: development
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/gitops-config
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }}-dev --region ${{ env.AWS_REGION }}
+      
+      - name: Update image tag in GitOps repo
+        run: |
+          cd gitops/apps/dev/${{ github.event.repository.name }}
+          yq eval '.spec.template.spec.containers[0].image = "${{ needs.build.outputs.image_full }}"' -i deployment.yaml
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "Update ${{ github.event.repository.name }} to ${{ needs.build.outputs.image_tag }}"
+          git push
+      
+      - name: Sync ArgoCD Application
+        run: |
+          argocd login ${{ secrets.ARGOCD_SERVER }} --username admin --password ${{ secrets.ARGOCD_PASSWORD }} --insecure
+          argocd app sync ${{ github.event.repository.name }}-dev --force
+          argocd app wait ${{ github.event.repository.name }}-dev --timeout 300
+      
+      # Datadog Deployment Tracking
+      - name: Datadog Deployment Event
+        uses: masci/datadog@v1
+        with:
+          api-key: ${{ secrets.DATADOG_API_KEY }}
+          events: |
+            - title: "Deployment to Dev: ${{ github.event.repository.name }}"
+              text: "Version ${{ needs.build.outputs.image_tag }} deployed to development"
+              alert_type: "info"
+              tags:
+                - "environment:development"
+                - "service:${{ github.event.repository.name }}"
+                - "version:${{ needs.build.outputs.image_tag }}"
+      
+      - name: Notify Slack - Dev Deployment
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,workflow
+          text: ':rocket: Deployed to DEV - ${{ github.event.repository.name }}:${{ needs.build.outputs.image_tag }}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ============================================
+  # Deploy to Production (EKS via ArgoCD + Octopus)
+  # ============================================
+  deploy-prod:
+    name: Deploy to Prod
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/gitops-config
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }}-prod --region ${{ env.AWS_REGION }}
+      
+      - name: Update image tag in GitOps repo
+        run: |
+          cd gitops/apps/prod/${{ github.event.repository.name }}
+          yq eval '.spec.template.spec.containers[0].image = "${{ needs.build.outputs.image_full }}"' -i deployment.yaml
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "Update ${{ github.event.repository.name }} to ${{ needs.build.outputs.image_tag }}"
+          git push
+      
+      # Trigger Octopus Deploy
+      - name: Trigger Octopus Deployment
+        run: |
+          curl -X POST "${{ secrets.OCTOPUS_SERVER_URL }}/api/deployments" \
+            -H "X-Octopus-ApiKey: ${{ secrets.OCTOPUS_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "ProjectId": "${{ secrets.OCTOPUS_PROJECT_ID }}",
+              "EnvironmentId": "${{ secrets.OCTOPUS_PROD_ENV_ID }}",
+              "ReleaseId": "${{ needs.build.outputs.image_tag }}",
+              "Comments": "Automated deployment from GitHub Actions"
+            }'
+        continue-on-error: true
+      
+      - name: Sync ArgoCD Application
+        run: |
+          argocd login ${{ secrets.ARGOCD_SERVER }} --username admin --password ${{ secrets.ARGOCD_PASSWORD }} --insecure
+          argocd app sync ${{ github.event.repository.name }}-prod --force
+          argocd app wait ${{ github.event.repository.name }}-prod --timeout 300
+      
+      # Datadog Deployment Tracking
+      - name: Datadog Deployment Event
+        uses: masci/datadog@v1
+        with:
+          api-key: ${{ secrets.DATADOG_API_KEY }}
+          events: |
+            - title: "Production Deployment: ${{ github.event.repository.name }}"
+              text: "Version ${{ needs.build.outputs.image_tag }} deployed to production"
+              alert_type: "success"
+              tags:
+                - "environment:production"
+                - "service:${{ github.event.repository.name }}"
+                - "version:${{ needs.build.outputs.image_tag }}"
+      
+      # Datadog Service Catalog Update
+      - name: Update Datadog Service Catalog
+        run: |
+          curl -X POST "https://api.datadoghq.com/api/v2/services/definitions" \
+            -H "DD-API-KEY: ${{ secrets.DATADOG_API_KEY }}" \
+            -H "DD-APPLICATION-KEY: ${{ secrets.DATADOG_APP_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "data": {
+                "type": "service-definition",
+                "attributes": {
+                  "schema-version": "v2",
+                  "dd-service": "${{ github.event.repository.name }}",
+                  "team": "bcg-platform",
+                  "contacts": [{"type": "slack", "contact": "#${{ github.event.repository.name }}-alerts"}],
+                  "repos": [{"name": "${{ github.repository }}", "provider": "github"}],
+                  "tags": ["env:production", "version:${{ needs.build.outputs.image_tag }}"]
+                }
+              }
+            }'
+        continue-on-error: true
+      
+      - name: Notify Slack - Prod Deployment
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,workflow
+          text: ':white_check_mark: Deployed to PRODUCTION - ${{ github.event.repository.name }}:${{ needs.build.outputs.image_tag }}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      
+      # Post deployment health check
+      - name: Health Check
+        run: |
+          sleep 30
+          kubectl rollout status deployment/${{ github.event.repository.name }} -n production --timeout=300s
