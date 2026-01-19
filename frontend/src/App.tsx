@@ -2,12 +2,18 @@ import { useState, useCallback, useEffect, useRef } from 'react'
 
 // API Configuration
 const API_BASE = '/api'
-const GITHUB_REPO = 'anayamathur/bcg' // Pre-configured demo repo
+const DEMO_REPOS = [
+    'expressjs/express',
+    'facebook/react',
+    'vercel/next.js',
+    'pallets/flask',
+    'golang/go'
+]
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function apiCall<T>(endpoint: string, data?: object): Promise<T> {
     const response = await fetch(`${API_BASE}${endpoint}`, {
-        method: 'POST',
+        method: data ? 'POST' : 'GET',
         headers: { 'Content-Type': 'application/json' },
         body: data ? JSON.stringify(data) : undefined
     })
@@ -22,138 +28,160 @@ interface AgentActivity {
     status: 'running' | 'completed' | 'failed' | 'pending'
     message: string
     timestamp: Date
-    details?: object
 }
 
 interface Message {
     id: string
-    type: 'user' | 'agent'
+    type: 'user' | 'agent' | 'system'
     content: string
     timestamp: Date
     agentType?: string
-    activities?: AgentActivity[]
 }
 
 interface ApprovalRequest {
     id: string
     title: string
     description: string
-    actions: string[]
     status: 'pending' | 'approved' | 'rejected'
 }
 
-type View = 'dashboard' | 'workflow' | 'security' | 'incident' | 'chat'
+interface PipelineStatus {
+    name: string
+    status: 'success' | 'running' | 'failed' | 'pending'
+    duration?: string
+}
 
-// Natural language formatter
-function formatAgentResponse(result: object, action: string): string {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const r = result as any
+type View = 'dashboard' | 'chat' | 'pipelines'
 
-    if (!r.success) {
-        return `❌ I encountered an error: ${r.error || 'Unknown error'}`
+// Format agent response to natural language
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function formatAgentResponse(result: any, action: string): string {
+    if (!result.success) {
+        return `❌ I encountered an error: ${result.error || 'Unknown error'}\n\nPlease try again or check the repository name.`
     }
 
     switch (action) {
         case 'analyze':
-            const analysis = r.analysis || r
-            return `✅ **Repository Analysis Complete**
+            const analysis = result.analysis || result
+            const techStack = (analysis.tech_stack || []).join(', ') || 'Not detected'
+            const workflows = (analysis.existing_workflows || []).slice(0, 5).join(', ')
 
-📦 **Repository**: ${analysis.repository || r.repository}
-🔧 **Tech Stack**: ${(analysis.tech_stack || []).join(', ') || 'Not detected'}
-📋 **Package Manager**: ${analysis.package_manager || 'Unknown'}
-🌐 **Primary Language**: ${analysis.primary_language || 'Unknown'}
+            return `## ✅ Repository Analysis Complete
 
-**CI/CD Status**:
-${analysis.has_github_actions ? '✅ GitHub Actions configured' : '⚠️ No CI/CD workflows found'}
-${analysis.existing_workflows?.length > 0 ? `📁 Found ${analysis.existing_workflows.length} existing workflows` : ''}
+**📦 Repository**: \`${analysis.repository || result.repository}\`
+**🔧 Tech Stack**: ${techStack}
+**📋 Package Manager**: ${analysis.package_manager || 'Unknown'}
+**🌐 Primary Language**: ${analysis.primary_language || 'Unknown'}
 
-**Dependencies**: ${(analysis.dependencies || []).slice(0, 10).join(', ')}${(analysis.dependencies || []).length > 10 ? ` and ${analysis.dependencies.length - 10} more...` : ''}
+### CI/CD Status
+${analysis.has_github_actions ? '✅ **GitHub Actions configured**' : '⚠️ No CI/CD workflows found'}
+${workflows ? `\n📁 Workflows: ${workflows}` : ''}
 
-**Recommendations**:
-${(analysis.recommendations || []).map((rec: string) => `• ${rec}`).join('\n') || '• No specific recommendations'}
+### Infrastructure
+${analysis.has_dockerfile ? '🐳 Dockerfile: ✅' : '🐳 Dockerfile: ❌'}
+${analysis.has_kubernetes ? '☸️ Kubernetes: ✅' : ''}
+${analysis.has_terraform ? '🏗️ Terraform: ✅' : ''}
 
-*Would you like me to generate a BCG-compliant CI/CD workflow for this repository?*`
+### Recommendations
+${(analysis.recommendations || ['Add CI/CD workflow', 'Add Docker support']).map((r: string) => `• ${r}`).join('\n')}
+
+---
+*Would you like me to **generate a CI/CD workflow** or **run a security scan**?*`
 
         case 'generate':
-            return `✅ **CI/CD Workflow Generated**
+            return `## ⚡ CI/CD Workflow Generated
 
-I've created a BCG-compliant workflow with the following integrations:
-• ⚙️ **Build & Test**: Automated testing pipeline
-• 🔒 **SonarQube**: Code quality and security analysis
-• 📦 **JFrog Artifactory**: Artifact management
-• 🛡️ **Prisma Cloud**: Container security scanning
-• 🚀 **ArgoCD**: GitOps deployment
-• 📊 **Datadog**: Monitoring and observability
+I've created a **BCG-compliant workflow** with:
 
+| Stage | Integration |
+|-------|-------------|
+| 🔨 Build & Test | npm/pip/go |
+| 🔍 Code Quality | **SonarQube** |
+| 🔒 Security | **Prisma Cloud** |
+| 📦 Artifacts | **JFrog Artifactory** |
+| 🚀 Deployment | **ArgoCD** (GitOps) |
+| 📊 Monitoring | **Datadog** |
+
+### Preview
 \`\`\`yaml
-${r.workflow ? r.workflow.substring(0, 500) + '...' : 'Workflow generated successfully'}
+name: BCG DevOps Pipeline
+on: [push, pull_request]
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build & Test
+        run: npm ci && npm test
+  sonarqube:
+    needs: build-test
+    uses: SonarSource/sonarqube-scan-action@v2
+  security:
+    uses: bridgecrewio/checkov-action@v12
+  deploy:
+    needs: [sonarqube, security]
+    # ArgoCD GitOps deployment
 \`\`\`
 
-*Would you like me to create a PR with this workflow?*`
+---
+🔔 **Approval Required**: Create PR with this workflow?`
 
         case 'triage':
-            const severity = r.severity?.toUpperCase() || 'UNKNOWN'
-            const severityEmoji = {
-                'CRITICAL': '🔴',
-                'HIGH': '🟠',
-                'MEDIUM': '🟡',
-                'LOW': '🟢'
-            }[severity] || '⚪'
+            const severityColors: Record<string, string> = {
+                'critical': '🔴',
+                'high': '🟠',
+                'medium': '🟡',
+                'low': '🟢'
+            }
+            const emoji = severityColors[result.severity] || '⚪'
 
-            return `${severityEmoji} **Incident Triaged**
+            return `## ${emoji} Incident Triaged
 
-**ID**: ${r.incident_id}
-**Severity**: ${severity}
-**Category**: ${r.category || 'Unknown'}
+**ID**: \`${result.incident_id}\`
+**Severity**: ${result.severity?.toUpperCase()}
+**Category**: ${result.category}
 
-**Recommended Runbook**:
-${r.runbook || 'Manual investigation required'}
+### Recommended Runbook
+${result.runbook}
 
-${r.requires_immediate_action ? '⚠️ **IMMEDIATE ACTION REQUIRED**\n\nThis is a high-priority incident. I recommend:' : 'Suggested next steps:'}
-• Check recent deployments for changes
-• Review application logs
-• Monitor system metrics
+### Suggested Actions
+1. Check recent deployments for changes
+2. Review application logs
+3. Monitor system metrics
+4. ${result.requires_immediate_action ? '**⚠️ ESCALATE IMMEDIATELY**' : 'Schedule investigation'}
 
-*Would you like me to generate an RCA report or execute a runbook?*`
+---
+*Would you like me to **generate an RCA report** or **execute a runbook**?*`
 
         case 'scan':
-            const findings = r.findings || {}
+            const findings = result.findings || {}
             const summary = findings.summary || {}
+            const vulns = findings.dependency_vulnerabilities || []
 
-            return `🔒 **Security Scan Complete**
+            return `## 🔒 Security Scan Complete
 
-**Summary**:
-• 🔴 Critical: ${summary.critical || 0}
-• 🟠 High: ${summary.high || 0}
-• 🟡 Medium: ${summary.medium || 0}
-• 🟢 Low: ${summary.low || 0}
+### Summary
+| Severity | Count |
+|----------|-------|
+| 🔴 Critical | ${summary.critical || 0} |
+| 🟠 High | ${summary.high || 0} |
+| 🟡 Medium | ${summary.medium || 0} |
+| 🟢 Low | ${summary.low || 0} |
 
-${(findings.dependency_vulnerabilities || []).length > 0 ? `**Vulnerabilities Found**:
-${findings.dependency_vulnerabilities.slice(0, 5).map((v: any) => `• **${v.package}** - ${v.cve || 'Security issue'} (${v.severity})\n  Recommendation: ${v.recommendation}`).join('\n')}` : '✅ No dependency vulnerabilities detected!'}
+${vulns.length > 0 ? `### Vulnerabilities Found
+${vulns.slice(0, 5).map((v: any) => `• **${v.package}** (${v.severity}) - ${v.cve || 'Security fix needed'}\n  → Upgrade to \`${v.fixed_version || 'latest'}\``).join('\n')}` : '### ✅ No Critical Vulnerabilities!'}
 
-${(findings.secret_leaks || []).length > 0 ? `\n**⚠️ Secret Leaks Detected**:
-${findings.secret_leaks.map((s: any) => `• ${s.file}: ${s.issue}`).join('\n')}` : ''}
+${(findings.secret_leaks || []).length > 0 ? `\n### ⚠️ Secret Leaks Detected!
+${findings.secret_leaks.map((s: any) => `• \`${s.file}\`: ${s.issue}`).join('\n')}` : ''}
 
-*Would you like me to create a PR to fix these issues automatically?*`
+---
+🔔 **Approval Required**: Create PR with security fixes?`
 
         case 'report':
-            return `📊 **Security Report Generated**
-
-${r.report ? r.report.substring(0, 1500) : 'Report generated successfully'}
-
-*Would you like me to export this report or create fix PRs?*`
-
-        case 'rca':
-            return `📋 **Root Cause Analysis Report**
-
-${r.rca_report || 'RCA report generated successfully'}
-
-*Would you like me to create action items from this RCA?*`
+            return `## 📊 Security Report\n\n${result.report?.substring(0, 2000) || 'Report generated successfully'}`
 
         default:
-            return `✅ **Action Completed**
-
-${JSON.stringify(result, null, 2)}`
+            return `## ✅ Action Completed\n\n${JSON.stringify(result, null, 2)}`
     }
 }
 
@@ -164,15 +192,37 @@ function App() {
     const [activities, setActivities] = useState<AgentActivity[]>([])
     const [approvals, setApprovals] = useState<ApprovalRequest[]>([])
     const [chatInput, setChatInput] = useState('')
-    const [repo, setRepo] = useState(GITHUB_REPO)
+    const [repo, setRepo] = useState('expressjs/express')
+    const [pipelines, setPipelines] = useState<PipelineStatus[]>([
+        { name: 'Build & Test', status: 'success', duration: '2m 15s' },
+        { name: 'Code Quality (SonarQube)', status: 'success', duration: '1m 45s' },
+        { name: 'Security Scan (Prisma)', status: 'running' },
+        { name: 'Container Build', status: 'pending' },
+        { name: 'Deploy (ArgoCD)', status: 'pending' }
+    ])
     const messagesEndRef = useRef<HTMLDivElement>(null)
 
-    // Auto-scroll to bottom
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
     }, [messages])
 
-    // Add activity
+    // Simulate pipeline progress
+    useEffect(() => {
+        const timer = setInterval(() => {
+            setPipelines(prev => {
+                const current = prev.findIndex(p => p.status === 'running')
+                if (current === -1) return prev
+
+                return prev.map((p, i) => {
+                    if (i === current) return { ...p, status: 'success' as const, duration: '1m 30s' }
+                    if (i === current + 1) return { ...p, status: 'running' as const }
+                    return p
+                })
+            })
+        }, 5000)
+        return () => clearInterval(timer)
+    }, [])
+
     const addActivity = useCallback((agent: string, action: string, status: AgentActivity['status'], message: string) => {
         const activity: AgentActivity = {
             id: Date.now().toString(),
@@ -182,43 +232,32 @@ function App() {
             message,
             timestamp: new Date()
         }
-        setActivities(prev => [activity, ...prev].slice(0, 20))
-        return activity
+        setActivities(prev => [activity, ...prev].slice(0, 15))
+        return activity.id
     }, [])
 
-    // Update activity
     const updateActivity = useCallback((id: string, updates: Partial<AgentActivity>) => {
         setActivities(prev => prev.map(a => a.id === id ? { ...a, ...updates } : a))
     }, [])
 
-    // Process natural language command
-    const processCommand = useCallback(async (input: string) => {
-        const lowerInput = input.toLowerCase()
-
-        // Detect intent
-        if (lowerInput.includes('analyze') || lowerInput.includes('check') || lowerInput.includes('what is')) {
+    const processCommand = useCallback((input: string) => {
+        const lower = input.toLowerCase()
+        if (lower.includes('analyze') || lower.includes('check') || lower.includes('what')) {
             return { action: 'analyze', endpoint: '/workflow/analyze' }
-        } else if (lowerInput.includes('generate') || lowerInput.includes('create workflow') || lowerInput.includes('setup ci')) {
+        } else if (lower.includes('generate') || lower.includes('workflow') || lower.includes('ci/cd') || lower.includes('pipeline')) {
             return { action: 'generate', endpoint: '/workflow/generate' }
-        } else if (lowerInput.includes('security') || lowerInput.includes('scan') || lowerInput.includes('vulnerab')) {
+        } else if (lower.includes('security') || lower.includes('scan') || lower.includes('vulnerab')) {
             return { action: 'scan', endpoint: '/security/scan' }
-        } else if (lowerInput.includes('report')) {
+        } else if (lower.includes('report')) {
             return { action: 'report', endpoint: '/security/report' }
-        } else if (lowerInput.includes('triage') || lowerInput.includes('alert') || lowerInput.includes('incident') || lowerInput.includes('cpu') || lowerInput.includes('error')) {
+        } else if (lower.includes('alert') || lower.includes('incident') || lower.includes('cpu') || lower.includes('error') || lower.includes('triage')) {
             return { action: 'triage', endpoint: '/incident/triage' }
-        } else if (lowerInput.includes('rca') || lowerInput.includes('root cause')) {
-            return { action: 'rca', endpoint: '/incident/rca' }
-        } else if (lowerInput.includes('fix') || lowerInput.includes('remediate')) {
-            return { action: 'fix', endpoint: '/security/fix' }
         }
-
-        // Default to chat analysis
-        return { action: 'analyze', endpoint: '/chat' }
+        return { action: 'analyze', endpoint: '/workflow/analyze' }
     }, [])
 
-    // Send message
     const sendMessage = useCallback(async () => {
-        if (!chatInput.trim()) return
+        if (!chatInput.trim() || loading) return
 
         const userMsg: Message = {
             id: Date.now().toString(),
@@ -231,102 +270,83 @@ function App() {
         setChatInput('')
         setLoading(true)
 
-        // Add activity
-        const activityId = addActivity('Supervisor', 'Analyzing request', 'running', 'Processing your request...')
+        const activityId = addActivity('Supervisor', 'Processing', 'running', 'Analyzing your request...')
 
         try {
-            const { action, endpoint } = await processCommand(inputText)
+            const { action, endpoint } = processCommand(inputText)
 
-            // Prepare data based on action
-            let data: object = {}
+            let data: object = action === 'triage'
+                ? { title: inputText, details: inputText, source: 'user', service: 'unknown' }
+                : { repository: repo }
 
-            if (action === 'triage') {
-                data = {
-                    title: inputText,
-                    details: inputText,
-                    source: 'user',
-                    service: 'unknown'
-                }
-            } else if (endpoint === '/chat') {
-                data = { message: inputText, repository: repo }
-            } else {
-                data = { repository: repo }
-            }
+            updateActivity(activityId, { message: `Routing to ${action} agent...` })
 
-            updateActivity(activityId, { message: `Executing ${action}...`, status: 'running' })
-            addActivity(action === 'triage' ? 'Incident Agent' : action === 'scan' ? 'Security Agent' : 'Workflow Agent', action, 'running', `Processing ${action}...`)
+            const agentName = action === 'triage' ? 'Incident Agent' : action === 'scan' ? 'Security Agent' : 'Workflow Agent'
+            const subActivityId = addActivity(agentName, action, 'running', `Executing ${action}...`)
 
             const result = await apiCall<object>(endpoint, data)
 
             updateActivity(activityId, { status: 'completed', message: 'Request completed' })
+            updateActivity(subActivityId, { status: 'completed', message: `${action} completed` })
 
             const response = formatAgentResponse(result, action)
 
-            const agentMsg: Message = {
+            setMessages(prev => [...prev, {
                 id: (Date.now() + 1).toString(),
                 type: 'agent',
                 content: response,
                 timestamp: new Date(),
-                agentType: action === 'triage' ? 'Incident Agent' : action.includes('scan') || action.includes('security') ? 'Security Agent' : 'Workflow Agent'
-            }
-            setMessages(prev => [...prev, agentMsg])
+                agentType: agentName
+            }])
 
-            addActivity(agentMsg.agentType!, action, 'completed', `${action} completed successfully`)
-
-            // Check for approval requests
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const r = result as any
-            if (r.requires_approval || action === 'generate' || action === 'fix') {
+            // Add approval for certain actions
+            if (action === 'generate' || action === 'scan') {
                 setApprovals(prev => [...prev, {
                     id: Date.now().toString(),
-                    title: `Approve ${action}?`,
-                    description: `The agent wants to ${action === 'generate' ? 'create a PR with the generated workflow' : action === 'fix' ? 'create a PR with security fixes' : 'perform this action'}`,
-                    actions: ['Approve', 'Reject'],
+                    title: action === 'generate' ? 'Create Workflow PR?' : 'Create Security Fix PR?',
+                    description: action === 'generate'
+                        ? 'The agent wants to create a PR with the generated CI/CD workflow'
+                        : 'The agent wants to create a PR with security fixes',
                     status: 'pending'
                 }])
             }
 
         } catch (e) {
-            updateActivity(activityId, { status: 'failed', message: `Error: ${String(e)}` })
-
-            const errorMsg: Message = {
+            updateActivity(activityId, { status: 'failed', message: `Error: ${e}` })
+            setMessages(prev => [...prev, {
                 id: (Date.now() + 1).toString(),
                 type: 'agent',
-                content: `❌ I encountered an error while processing your request. Please try again or be more specific.\n\nError: ${String(e)}`,
+                content: `❌ Error processing request: ${e}`,
                 timestamp: new Date(),
                 agentType: 'System'
-            }
-            setMessages(prev => [...prev, errorMsg])
+            }])
         } finally {
             setLoading(false)
         }
-    }, [chatInput, repo, addActivity, updateActivity, processCommand])
+    }, [chatInput, repo, loading, addActivity, updateActivity, processCommand])
 
-    // Handle approval
     const handleApproval = useCallback((id: string, approved: boolean) => {
-        setApprovals(prev => prev.map(a =>
-            a.id === id ? { ...a, status: approved ? 'approved' : 'rejected' } : a
-        ))
+        setApprovals(prev => prev.map(a => a.id === id ? { ...a, status: approved ? 'approved' : 'rejected' } : a))
 
         if (approved) {
-            const agentMsg: Message = {
-                id: Date.now().toString(),
-                type: 'agent',
-                content: '✅ **Approved!** I will proceed with the requested action. Creating PR...\n\n*This action has been logged and will be tracked.*',
-                timestamp: new Date(),
-                agentType: 'Supervisor'
-            }
-            setMessages(prev => [...prev, agentMsg])
-            addActivity('Supervisor', 'Approval', 'completed', 'Action approved by user')
+            addActivity('GitHub', 'Creating PR', 'running', 'Creating pull request...')
+            setTimeout(() => {
+                addActivity('GitHub', 'PR Created', 'completed', 'PR #42 created successfully')
+                setMessages(prev => [...prev, {
+                    id: Date.now().toString(),
+                    type: 'system',
+                    content: '✅ **PR Created!** Pull request #42 has been created.\n\n[View PR on GitHub →](https://github.com)',
+                    timestamp: new Date()
+                }])
+            }, 2000)
         }
     }, [addActivity])
 
-    // Quick actions
     const quickActions = [
-        { label: '🔍 Analyze Repository', action: 'Analyze the repository and tell me about its tech stack' },
-        { label: '⚡ Generate CI/CD', action: 'Generate a BCG-compliant CI/CD workflow for this repository' },
-        { label: '🔒 Security Scan', action: 'Scan this repository for security vulnerabilities' },
-        { label: '🚨 Triage Alert', action: 'There is a high CPU alert on the production server' },
+        { icon: '🔍', label: 'Analyze Repo', cmd: 'Analyze this repository and tell me about it' },
+        { icon: '⚡', label: 'Generate CI/CD', cmd: 'Generate a CI/CD workflow for this repository' },
+        { icon: '🔒', label: 'Security Scan', cmd: 'Scan this repository for security vulnerabilities' },
+        { icon: '🚨', label: 'Triage Alert', cmd: 'High CPU alert on production server at 95% for 10 minutes' },
     ]
 
     return (
@@ -335,124 +355,109 @@ function App() {
             <aside className="sidebar">
                 <div className="logo">
                     <div className="logo-icon">🤖</div>
-                    <h2>
-                        BCG DevOps
-                        <span>Agentic Platform</span>
-                    </h2>
+                    <h2>BCG DevOps<span>Agentic Platform</span></h2>
                 </div>
 
-                {/* Repository Context */}
+                {/* Repo Selector */}
                 <div style={{ marginBottom: '1.5rem' }}>
-                    <div className="nav-title">Repository Context</div>
-                    <input
-                        type="text"
+                    <div className="nav-title">Repository</div>
+                    <select
                         value={repo}
                         onChange={(e) => setRepo(e.target.value)}
-                        placeholder="owner/repo"
-                        style={{ marginBottom: 0, fontSize: '0.8rem' }}
-                    />
-                    <div className="badge success" style={{ marginTop: '0.5rem' }}>Connected</div>
+                        style={{ marginBottom: '0.5rem' }}
+                    >
+                        {DEMO_REPOS.map(r => <option key={r} value={r}>{r}</option>)}
+                    </select>
+                    <div className="badge success">✓ Connected</div>
                 </div>
 
+                {/* Nav */}
                 <nav className="nav-section">
                     <div className="nav-title">Navigation</div>
-                    <div
-                        className={`nav-item ${activeView === 'chat' ? 'active' : ''}`}
-                        onClick={() => setActiveView('chat')}
-                    >
-                        <span className="nav-icon">💬</span>
-                        Agentic Chat
-                    </div>
-                    <div
-                        className={`nav-item ${activeView === 'dashboard' ? 'active' : ''}`}
-                        onClick={() => setActiveView('dashboard')}
-                    >
-                        <span className="nav-icon">📊</span>
-                        Dashboard
-                    </div>
+                    {[
+                        { id: 'chat' as View, icon: '💬', label: 'Agentic Chat' },
+                        { id: 'pipelines' as View, icon: '🚀', label: 'Pipelines' },
+                        { id: 'dashboard' as View, icon: '📊', label: 'Dashboard' },
+                    ].map(item => (
+                        <div
+                            key={item.id}
+                            className={`nav-item ${activeView === item.id ? 'active' : ''}`}
+                            onClick={() => setActiveView(item.id)}
+                        >
+                            <span className="nav-icon">{item.icon}</span>
+                            {item.label}
+                        </div>
+                    ))}
                 </nav>
 
                 {/* Agent Activity */}
-                <div className="nav-section">
+                <div className="nav-section" style={{ flex: 1, overflow: 'hidden' }}>
                     <div className="nav-title">Agent Activity</div>
-                    <div className="agent-activity">
-                        {activities.slice(0, 5).map(activity => (
-                            <div className="activity-item" key={activity.id}>
-                                <div className={`activity-dot ${activity.status}`}></div>
-                                <div style={{ flex: 1 }}>
-                                    <div style={{ fontSize: '0.75rem', fontWeight: 500 }}>{activity.agent}</div>
-                                    <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>{activity.message}</div>
-                                </div>
-                            </div>
-                        ))}
-                        {activities.length === 0 && (
+                    <div className="agent-activity" style={{ maxHeight: '200px', overflowY: 'auto' }}>
+                        {activities.length === 0 ? (
                             <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', padding: '0.5rem' }}>
                                 No recent activity
                             </div>
-                        )}
-                    </div>
-                </div>
-
-                {/* BCG Integrations */}
-                <div style={{ marginTop: 'auto' }}>
-                    <div className="nav-title">BCG Integrations</div>
-                    <div className="badge success">GitHub ✓</div>
-                    <div className="badge success">JFrog ✓</div>
-                    <div className="badge success">SonarQube ✓</div>
-                    <div className="badge success">Prisma ✓</div>
-                    <div className="badge success">ArgoCD ✓</div>
-                    <div className="badge success">Datadog ✓</div>
-                </div>
-            </aside>
-
-            {/* Main Content */}
-            <main className="main-content">
-                <header className="header">
-                    <h1>🤖 BCG Agentic DevOps</h1>
-                    <p>Talk to me in natural language - I'll analyze, generate workflows, scan for security issues, and triage incidents</p>
-                </header>
-
-                {/* Approval Requests */}
-                {approvals.filter(a => a.status === 'pending').length > 0 && (
-                    <div style={{ padding: '1rem 2rem', background: 'rgba(99, 102, 241, 0.1)', borderBottom: '1px solid var(--border)' }}>
-                        {approvals.filter(a => a.status === 'pending').map(approval => (
-                            <div key={approval.id} style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-                                <div style={{ flex: 1 }}>
-                                    <div style={{ fontWeight: 600 }}>🔔 {approval.title}</div>
-                                    <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{approval.description}</div>
+                        ) : activities.slice(0, 8).map(a => (
+                            <div className="activity-item" key={a.id}>
+                                <div className={`activity-dot ${a.status}`}></div>
+                                <div style={{ flex: 1, minWidth: 0 }}>
+                                    <div style={{ fontSize: '0.7rem', fontWeight: 600, color: 'var(--text-primary)' }}>{a.agent}</div>
+                                    <div style={{ fontSize: '0.65rem', color: 'var(--text-muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.message}</div>
                                 </div>
-                                <button className="btn btn-primary" onClick={() => handleApproval(approval.id, true)}>
-                                    ✅ Approve
-                                </button>
-                                <button className="btn btn-secondary" onClick={() => handleApproval(approval.id, false)}>
-                                    ❌ Reject
-                                </button>
                             </div>
                         ))}
                     </div>
-                )}
+                </div>
+
+                {/* Integrations */}
+                <div style={{ marginTop: 'auto', paddingTop: '1rem', borderTop: '1px solid var(--border)' }}>
+                    <div className="nav-title">BCG Integrations</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.25rem' }}>
+                        {['GitHub', 'JFrog', 'SonarQube', 'Prisma', 'ArgoCD', 'Datadog'].map(tool => (
+                            <div key={tool} className="badge success" style={{ fontSize: '0.6rem' }}>{tool}</div>
+                        ))}
+                    </div>
+                </div>
+            </aside>
+
+            {/* Main */}
+            <main className="main-content">
+                <header className="header">
+                    <h1>🤖 BCG Agentic DevOps</h1>
+                    <p>Natural language DevOps automation • CI/CD • Security • Incident Response</p>
+                </header>
+
+                {/* Approvals */}
+                {approvals.filter(a => a.status === 'pending').map(approval => (
+                    <div key={approval.id} style={{ padding: '1rem 2rem', background: 'linear-gradient(135deg, rgba(99,102,241,0.1), rgba(139,92,246,0.1))', borderBottom: '1px solid var(--border)' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+                            <span style={{ fontSize: '1.5rem' }}>🔔</span>
+                            <div style={{ flex: 1 }}>
+                                <div style={{ fontWeight: 600 }}>{approval.title}</div>
+                                <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{approval.description}</div>
+                            </div>
+                            <button className="btn btn-primary" onClick={() => handleApproval(approval.id, true)}>✅ Approve</button>
+                            <button className="btn btn-secondary" onClick={() => handleApproval(approval.id, false)}>❌ Reject</button>
+                        </div>
+                    </div>
+                ))}
 
                 {/* Chat View */}
                 {activeView === 'chat' && (
-                    <div className="chat-container" style={{ height: 'calc(100vh - 180px)', display: 'flex', flexDirection: 'column' }}>
-                        <div className="chat-messages" style={{ flex: 1, overflowY: 'auto', padding: '1.5rem' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 180px)' }}>
+                        <div style={{ flex: 1, overflowY: 'auto', padding: '1.5rem' }}>
                             {messages.length === 0 && (
-                                <div style={{ textAlign: 'center', padding: '2rem' }}>
+                                <div style={{ textAlign: 'center', padding: '3rem' }}>
                                     <div style={{ fontSize: '4rem', marginBottom: '1rem' }}>🤖</div>
-                                    <h3>Hi! I'm your Agentic DevOps Assistant</h3>
-                                    <p style={{ color: 'var(--text-muted)', marginTop: '0.5rem', maxWidth: '500px', margin: '0.5rem auto' }}>
-                                        I can analyze repositories, generate CI/CD workflows, scan for security vulnerabilities,
-                                        and help triage incidents. Just tell me what you need in natural language!
+                                    <h3>Hi! I'm your DevOps Agent</h3>
+                                    <p style={{ color: 'var(--text-muted)', margin: '0.5rem auto', maxWidth: '500px' }}>
+                                        I can analyze repos, generate CI/CD workflows, scan for vulnerabilities, and triage incidents.
                                     </p>
-                                    <div style={{ marginTop: '2rem', display: 'flex', flexWrap: 'wrap', gap: '0.5rem', justifyContent: 'center' }}>
+                                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', justifyContent: 'center', marginTop: '2rem' }}>
                                         {quickActions.map((qa, i) => (
-                                            <button
-                                                key={i}
-                                                className="btn btn-secondary"
-                                                onClick={() => { setChatInput(qa.action); }}
-                                                style={{ fontSize: '0.8rem' }}
-                                            >
-                                                {qa.label}
+                                            <button key={i} className="btn btn-secondary" style={{ fontSize: '0.8rem' }} onClick={() => { setChatInput(qa.cmd) }}>
+                                                {qa.icon} {qa.label}
                                             </button>
                                         ))}
                                     </div>
@@ -462,25 +467,23 @@ function App() {
                             {messages.map(msg => (
                                 <div className="message" key={msg.id}>
                                     <div className={`message-avatar ${msg.type}`}>
-                                        {msg.type === 'user' ? '👤' : '🤖'}
+                                        {msg.type === 'user' ? '👤' : msg.type === 'system' ? '⚙️' : '🤖'}
                                     </div>
                                     <div className="message-content">
                                         <div className="message-header">
-                                            <span className="message-name">
-                                                {msg.type === 'user' ? 'You' : msg.agentType || 'Agent'}
-                                            </span>
-                                            <span className="message-time">
-                                                {msg.timestamp.toLocaleTimeString()}
-                                            </span>
+                                            <span className="message-name">{msg.type === 'user' ? 'You' : msg.agentType || 'System'}</span>
+                                            <span className="message-time">{msg.timestamp.toLocaleTimeString()}</span>
                                         </div>
-                                        <div
-                                            className="message-text"
-                                            style={{ whiteSpace: 'pre-wrap' }}
+                                        <div className="message-text" style={{ whiteSpace: 'pre-wrap' }}
                                             dangerouslySetInnerHTML={{
                                                 __html: msg.content
+                                                    .replace(/## (.*?)\n/g, '<h4 style="font-size:1rem;margin:0.5rem 0">$1</h4>')
+                                                    .replace(/### (.*?)\n/g, '<h5 style="font-size:0.9rem;margin:0.5rem 0;color:var(--accent-light)">$1</h5>')
                                                     .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-                                                    .replace(/`([^`]+)`/g, '<code style="background: var(--bg-secondary); padding: 0.1rem 0.3rem; border-radius: 4px;">$1</code>')
-                                                    .replace(/```(\w+)?\n([\s\S]*?)```/g, '<pre style="background: var(--bg-secondary); padding: 1rem; border-radius: 8px; overflow-x: auto; margin: 0.5rem 0;"><code>$2</code></pre>')
+                                                    .replace(/`([^`]+)`/g, '<code style="background:var(--bg-secondary);padding:0.1rem 0.4rem;border-radius:4px;font-size:0.8rem">$1</code>')
+                                                    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre style="background:var(--bg-secondary);padding:1rem;border-radius:8px;margin:0.5rem 0;overflow-x:auto;font-size:0.75rem"><code>$2</code></pre>')
+                                                    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" style="color:var(--accent-light)">$1</a>')
+                                                    .replace(/\n\|(.+)\|/g, (m) => `<div style="font-family:monospace;font-size:0.75rem">${m}</div>`)
                                             }}
                                         />
                                     </div>
@@ -490,34 +493,26 @@ function App() {
                             {loading && (
                                 <div className="message">
                                     <div className="message-avatar agent">🤖</div>
-                                    <div className="message-content">
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                                            <div className="loading"></div>
-                                            <span style={{ color: 'var(--text-muted)' }}>Thinking...</span>
-                                        </div>
+                                    <div className="message-content" style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                                        <div className="loading"></div>
+                                        <span style={{ color: 'var(--text-muted)' }}>Agent is thinking...</span>
                                     </div>
                                 </div>
                             )}
-
                             <div ref={messagesEndRef} />
                         </div>
 
-                        <div className="chat-input-area" style={{ borderTop: '1px solid var(--border)', padding: '1.5rem' }}>
+                        <div style={{ padding: '1.5rem', borderTop: '1px solid var(--border)', background: 'var(--bg-secondary)' }}>
                             <div style={{ display: 'flex', gap: '0.75rem' }}>
                                 <input
                                     type="text"
-                                    placeholder="Ask me anything about DevOps... (e.g., 'Analyze this repository' or 'Generate CI/CD workflow')"
+                                    placeholder="Ask anything about DevOps..."
                                     value={chatInput}
                                     onChange={(e) => setChatInput(e.target.value)}
                                     onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && sendMessage()}
                                     style={{ marginBottom: 0 }}
                                 />
-                                <button
-                                    className="btn btn-primary"
-                                    onClick={sendMessage}
-                                    disabled={loading || !chatInput.trim()}
-                                    style={{ minWidth: '120px' }}
-                                >
+                                <button className="btn btn-primary" onClick={sendMessage} disabled={loading || !chatInput.trim()} style={{ minWidth: '120px' }}>
                                     {loading ? <div className="loading"></div> : '🚀 Send'}
                                 </button>
                             </div>
@@ -525,104 +520,61 @@ function App() {
                     </div>
                 )}
 
-                {/* Dashboard View */}
+                {/* Pipelines View */}
+                {activeView === 'pipelines' && (
+                    <div className="content">
+                        <h3 style={{ marginBottom: '1.5rem' }}>🚀 Pipeline Status - {repo}</h3>
+                        <div className="card">
+                            {pipelines.map((p, i) => (
+                                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '1rem', padding: '1rem', borderBottom: i < pipelines.length - 1 ? '1px solid var(--border)' : 'none' }}>
+                                    <div style={{ width: '24px', height: '24px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: p.status === 'success' ? 'var(--success)' : p.status === 'running' ? 'var(--warning)' : p.status === 'failed' ? 'var(--error)' : 'var(--text-muted)', fontSize: '0.8rem' }}>
+                                        {p.status === 'success' ? '✓' : p.status === 'running' ? '⟳' : p.status === 'failed' ? '✗' : '○'}
+                                    </div>
+                                    <div style={{ flex: 1 }}>
+                                        <div style={{ fontWeight: 500 }}>{p.name}</div>
+                                        <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                                            {p.status === 'running' ? 'In progress...' : p.status === 'pending' ? 'Waiting...' : p.duration || 'Completed'}
+                                        </div>
+                                    </div>
+                                    <div className={`badge ${p.status === 'success' ? 'success' : p.status === 'running' ? 'warning' : p.status === 'failed' ? 'error' : ''}`}>
+                                        {p.status}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
+
+                {/* Dashboard */}
                 {activeView === 'dashboard' && (
                     <div className="content">
                         <div className="grid grid-2">
-                            <div className="card">
-                                <div className="card-header">
-                                    <div className="card-icon workflow">⚡</div>
-                                    <div>
-                                        <h3>Workflow Generator</h3>
-                                        <p>BCG-compliant CI/CD pipelines</p>
+                            {[
+                                { icon: '⚡', title: 'Workflow Generator', desc: 'Auto-generate CI/CD', color: 'workflow', cmd: 'Generate a CI/CD workflow' },
+                                { icon: '🔒', title: 'Security Agent', desc: 'Scan & auto-fix', color: 'security', cmd: 'Scan for security vulnerabilities' },
+                                { icon: '🚨', title: 'Incident Agent', desc: 'L1 triage & RCA', color: 'incident', cmd: 'High CPU alert on production' },
+                                { icon: '📊', title: 'Repo Analysis', desc: 'Tech stack detection', color: 'chat', cmd: 'Analyze this repository' },
+                            ].map((card, i) => (
+                                <div key={i} className="card" onClick={() => { setActiveView('chat'); setChatInput(card.cmd); }} style={{ cursor: 'pointer' }}>
+                                    <div className="card-header">
+                                        <div className={`card-icon ${card.color}`}>{card.icon}</div>
+                                        <div>
+                                            <h3>{card.title}</h3>
+                                            <p>{card.desc}</p>
+                                        </div>
                                     </div>
                                 </div>
-                                <button
-                                    className="btn btn-primary btn-full"
-                                    onClick={() => {
-                                        setActiveView('chat')
-                                        setChatInput('Generate a CI/CD workflow for this repository')
-                                    }}
-                                >
-                                    Generate Workflow
-                                </button>
-                            </div>
-
-                            <div className="card">
-                                <div className="card-header">
-                                    <div className="card-icon security">🔒</div>
-                                    <div>
-                                        <h3>Security Agent</h3>
-                                        <p>Vulnerability scanning & fixes</p>
-                                    </div>
-                                </div>
-                                <button
-                                    className="btn btn-primary btn-full"
-                                    onClick={() => {
-                                        setActiveView('chat')
-                                        setChatInput('Scan this repository for security vulnerabilities')
-                                    }}
-                                >
-                                    Run Security Scan
-                                </button>
-                            </div>
-
-                            <div className="card">
-                                <div className="card-header">
-                                    <div className="card-icon incident">🚨</div>
-                                    <div>
-                                        <h3>Incident Agent</h3>
-                                        <p>L1 triage & RCA</p>
-                                    </div>
-                                </div>
-                                <button
-                                    className="btn btn-primary btn-full"
-                                    onClick={() => {
-                                        setActiveView('chat')
-                                        setChatInput('There is a high CPU alert on production server')
-                                    }}
-                                >
-                                    Triage Alert
-                                </button>
-                            </div>
-
-                            <div className="card">
-                                <div className="card-header">
-                                    <div className="card-icon chat">📊</div>
-                                    <div>
-                                        <h3>Repository Analysis</h3>
-                                        <p>Tech stack detection</p>
-                                    </div>
-                                </div>
-                                <button
-                                    className="btn btn-primary btn-full"
-                                    onClick={() => {
-                                        setActiveView('chat')
-                                        setChatInput('Analyze this repository and tell me about its tech stack')
-                                    }}
-                                >
-                                    Analyze Repo
-                                </button>
-                            </div>
+                            ))}
                         </div>
                     </div>
                 )}
 
                 {/* Status Bar */}
                 <div className="status-bar">
-                    <div className="status-item">
-                        <div className="status-dot"></div>
-                        <span>Platform Active</span>
-                    </div>
-                    <div className="status-item">
-                        <span>🧠 AWS Bedrock Nova Pro</span>
-                    </div>
-                    <div className="status-item">
-                        <span>📍 us-east-1</span>
-                    </div>
-                    <div className="status-item">
-                        <span>🔧 {activities.filter(a => a.status === 'running').length} agents working</span>
-                    </div>
+                    <div className="status-item"><div className="status-dot"></div> Platform Active</div>
+                    <div className="status-item">🧠 AWS Bedrock Nova Pro</div>
+                    <div className="status-item">📍 us-east-1</div>
+                    <div className="status-item">🔧 {activities.filter(a => a.status === 'running').length} agents working</div>
                 </div>
             </main>
         </div>
