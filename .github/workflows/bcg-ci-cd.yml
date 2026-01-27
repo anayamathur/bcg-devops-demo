@@ -1,123 +1,148 @@
-name: BCG CI/CD Pipeline - Python
+name: BCG CI/CD Pipeline
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
+    branches:
+      - main
 
 permissions:
   contents: read
   packages: write
-  security-events: write
-
-env:
-  PYTHON_VERSION: '3.11'
-  JFROG_REGISTRY: ${{ secrets.JFROG_REGISTRY }}
-  APP_NAME: 'bcg-devops-demo'
+  actions: write
 
 jobs:
-  build-test:
-    name: Build & Test
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest pytest-cov flake8 bandit
-      
-      - name: Lint with flake8
-        run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        continue-on-error: true
-      
-      - name: Run Tests
-        run: pytest --cov=. --cov-report=xml
-      
-      - name: Upload Coverage
-        uses: codecov/codecov-action@v4
-        with:
-          files: coverage.xml
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-  code-quality:
-    name: SonarQube Analysis
-    runs-on: ubuntu-latest
-    needs: build-test
-    
-    steps:
-      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          fetch-depth: 0
-      
-      - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@v2.3.0
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          python-version: '3.x'
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest
 
   security-scan:
-    name: Security Scanning
     runs-on: ubuntu-latest
-    needs: build-test
-    
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Bandit Security Scan
-        run: |
-          pip install bandit
-          bandit -r . -f json -o bandit-report.json || true
-      
-      - name: Snyk Python Scan
-        uses: snyk/actions/python@master
-        continue-on-error: true
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Snyk Security Scan
+        uses: snyk/actions/python@v1
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: test --severity-threshold=medium
 
-  container-build:
-    name: Build Container
+  code-quality:
     runs-on: ubuntu-latest
-    needs: [code-quality, security-scan]
-    if: github.event_name == 'push'
-    
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Login to JFrog
-        uses: docker/login-action@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarcloud-github-action@v1.8
         with:
-          registry: ${{ env.JFROG_REGISTRY }}
-          username: ${{ secrets.JFROG_USER }}
-          password: ${{ secrets.JFROG_ACCESS_TOKEN }}
-      
-      - name: Build and Push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ${{ env.JFROG_REGISTRY }}/${{ env.APP_NAME }}:${{ github.sha }}
+          args: >
+            -Dsonar.projectKey=anayamathur_bcg-devops-demo
+            -Dsonar.sources=.
+            -Dsonar.host.url=https://sonarcloud.io
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }}
 
   deploy:
-    name: Deploy via ArgoCD
+    needs: [build, security-scan, code-quality]
     runs-on: ubuntu-latest
-    needs: container-build
+    timeout-minutes: 10
+    if: github.ref =='refs/heads/main'
     environment: production
-    
     steps:
-      - name: ArgoCD Sync
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
         run: |
-          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-          chmod +x argocd
-          ./argocd login ${{ secrets.ARGOCD_SERVER }} --username ${{ secrets.ARGOCD_USERNAME }} --password ${{ secrets.ARGOCD_PASSWORD }} --insecure
-          ./argocd app set ${{ env.APP_NAME }} --helm-set image.tag=${{ github.sha }}
-          ./argocd app sync ${{ env.APP_NAME }}
+          docker build -t bcg-devops-demo.
+          docker tag bcg-devops-demo:latest ${{ secrets.JFROG_REGISTRY }}/bcg-devops-demo:latest
+
+      - name: Login to JFrog Artifactory
+        run: echo ${{ secrets.JFROG_PASSWORD }} | docker login ${{ secrets.JFROG_REGISTRY }} -u ${{ secrets.JFROG_USERNAME }} --password-stdin
+
+      - name: Push Docker image to JFrog Artifactory
+        run: docker push ${{ secrets.JFROG_REGISTRY }}/bcg-devops-demo:latest
+
+      - name: Deploy to ArgoCD
+        uses: argocd/argocd-github-action@v2
+        with:
+          manifest: |
+            apiVersion: argoproj.io/v1alpha1
+            kind: Application
+            metadata:
+              name: bcg-devops-demo
+            spec:
+              source:
+                repoURL: https://github.com/anayamathur/bcg-devops-demo
+                targetRevision: HEAD
+                path: k8s
+              destination:
+                server: https://kubernetes.default.svc
+                namespace: default
+              syncPolicy:
+                automated:
+                  prune: true
+                  selfHeal: true
+                syncOptions:
+                  - CreateNamespace=true
+          argocd_url: ${{ secrets.ARGOCD_URL }}
+          argocd_username: ${{ secrets.ARGOCD_USERNAME }}
+          argocd_password: ${{ secrets.ARGOCD_PASSWORD }}
+
+  notify:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: success()
+    steps:
+      - name: Send Slack notification
+        uses: 8398a7/action-slack@v3
+        with:
+          payload: |
+            {
+              "text": "Deployment successful! :tada:"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  monitor:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Monitor with Datadog
+        run: |
+          curl -X POST "https://api.datadoghq.com/api/v1/events" \
+          -H "Content-Type: application/json" \
+          -H "DD-API-KEY: ${{ secrets.DATADOG_API_KEY }}" \
+          -d '{
+            "title": "Deployment completed",
+            "text": "The deployment of bcg-devops-demo has been completed.",
+            "tags": ["deployment", "bcg-devops-demo"]
+          }'
